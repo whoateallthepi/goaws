@@ -13,10 +13,11 @@ import (
 
 // Program control constants
 const (
-	debounce               = time.Millisecond * 100 //
-	windMultiplier float32 = 2.4                    // one windclick per second = 2.4km/h
-	rainMultiplier float32 = 0.2794                 // one click of the rain gauge = .2794 mm of rain
-	alarmNumber            = 2
+	debounce                = time.Millisecond * 100 //
+	windMultiplier  float32 = 2.4                    // one windclick per second = 2.4km/h
+	rainMultiplier  float32 = 0.2794                 // one click of the rain gauge = .2794 mm of rain
+	alarmNumber             = 2
+	reportFrequency         = 10 // Every 10 minutes - should be a divisor of 60
 )
 
 // Interface for loraWan
@@ -24,6 +25,22 @@ type lorawan rak8nn.Networker
 
 // Interface for clock
 type clock ds3231.Clocker // Interface
+
+// All the values needed for a weather report
+type weatherReport struct {
+	temperature      float32
+	humidity         float32
+	pressure         float32
+	mslp             float32
+	currentWind      windVector
+	dailyGust        windVector
+	twoMinuteAverage windVector
+	tenMinuteGust    windVector
+	rainToday        float32
+	rain1hour        float32
+	rainSinceLast    float32
+	battery          float32
+}
 
 // status is used for error reporting - see StatusErr
 type status int
@@ -39,6 +56,7 @@ const (
 	noSensor = iota + 1
 	noWindADC
 	failedSend
+	clockError
 	untrappedError
 )
 
@@ -107,7 +125,8 @@ func main() {
 	// create a channels for windclicks, rainclicks
 	windClick := make(chan emptyStruct, 1) // buffer just in case
 	rainClick := make(chan emptyStruct, 1) // do not want interrrups blocking
-	alarmSound := make(chan emptyStruct, 1)
+	//alarmSound := make(chan emptyStruct, 1)
+	//report := make(chan emptyStruct)
 
 	done := make(chan emptyStruct)
 
@@ -148,10 +167,11 @@ func main() {
 			lastRainInterrupt = now
 		}
 	})
-	alarmPin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
-		fmt.Printf("alarm interrupt\n")
-		alarmSound <- emptyStruct{}
-	})
+	/*
+		alarmPin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
+			fmt.Printf("alarm interrupt\n")
+			alarmSound <- emptyStruct{}
+		}) */
 
 	// ADCs
 	machine.InitADC()
@@ -160,17 +180,26 @@ func main() {
 
 	//========================== Set the alarm - every second ==================
 	// get the current time as a starting point
-	dt, err := clock.Read(&cd)
+	/* dt, err := clock.Read(&cd)
 	if err != nil {
 		fmt.Println("Error reading date:", err)
 
 	}
 	err = clock.SetAlarm(&cd, dt, alarmNumber, ds3231.Minutely) //
+	*/
+	rtc, err := clock.Read(&cd)
+	if err != nil {
+		fmt.Printf("failed to read clock: %s", err)
+	}
 
-	//
+	//machineClock := time.Now()
+
+	//clockOffset := rtc.Sub(machineClock) //
+
+	// */
 	//========================= Kick off sub-processes =========================
 	//
-	// the routine for seconds processing
+
 	secondTicker := time.NewTicker(time.Second)
 
 	go secondProcessing(secondTicker,
@@ -183,9 +212,12 @@ func main() {
 		&rainHour,
 		&rainToday,
 		&rainSinceLast,
-		windSensor)
+		windSensor,
+		rtc)
 
-	go minuteProcessing(&cd, alarmSound)
+	//go minuteProcessing(&cd, alarmSound, report)
+
+	//go reportWeather(report)
 
 	for {
 
@@ -262,17 +294,21 @@ func secondProcessing(t *time.Ticker,
 	rainHour *[60]float32,
 	rainToday *float32,
 	rainSinceLast *float32,
-	ws machine.ADC) error {
+	ws machine.ADC,
+	rtc time.Time) error {
 
 	var windClicks uint8
 
 	// Indexes to various arrays
 	var seconds2m, seconds, minutes, minutes10m uint8
 
+	realTime := rtc
+
 	for {
 		select {
 		case <-t.C: /// this is the every second code
-
+			// Keep track of real time
+			realTime = realTime.Add(time.Second)
 			windDir, err := getWindDirection(ws)
 			if err != nil {
 				fmt.Printf("error from wind sensor: %s\n", err)
@@ -321,6 +357,15 @@ func secondProcessing(t *time.Ticker,
 			windClicks = 0 // reset for next second
 
 			fmt.Printf("Rain today: %2.2f \n", *rainToday)
+			fmt.Printf("mm: %d\n", realTime.Minute())
+			if realTime.Second() == 0 {
+				r := realTime.Minute() % reportFrequency
+				fmt.Printf("realTime: %t\n", realTime)
+				if r == 0 { // time for a weather report
+					go reportWeather()
+				}
+
+			}
 
 		case <-wind:
 			windClicks++
@@ -337,8 +382,15 @@ func secondProcessing(t *time.Ticker,
 
 	}
 }
+func minuteProcessing() {
+	fmt.Printf("Minute processing ************\n")
+}
 
-func minuteProcessing(d *ds3231.Device, alarm <-chan emptyStruct) error {
+/*func minuteProcessing(d *ds3231.Device,
+
+	alarm <-chan emptyStruct,
+	report chan<- emptyStruct) error {
+
 	for {
 		_, ok := <-alarm
 		if !ok {
@@ -347,9 +399,39 @@ func minuteProcessing(d *ds3231.Device, alarm <-chan emptyStruct) error {
 		}
 		fmt.Printf("Minute processing ************\n")
 		clock.SilenceAlarm(d, alarmNumber)
+		// read the clock
+
+		t, err := clock.Read(d)
+
+		if err != nil {
+			return statusErr{
+				status:  clockError,
+				message: fmt.Sprintf("failed to read clock:%s", err),
+			}
+		}
+		// if it is time for a weather report - signal to the report
+		// channel and reportWeather() takes over.
+		r := t.Minute() % reportFrequency
+		if r == 0 {
+			report <- emptyStruct{}
+		}
+
 	}
 
-}
+} */
+
+func reportWeather() { fmt.Printf("************* report weather\n") }
+
+/*
+func reportWeather(r <-chan emptyStruct) error {
+	// Need to copy all the arrays as the recording will continue in the
+	// background. Also midnight reset needs to wait until report has copied
+	// arrays.
+
+	<-r
+	fmt.Printf("************* report weather\n")
+	return nil
+} */
 
 // ================== Calculation and conversion routines =======================
 //

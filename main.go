@@ -3,12 +3,14 @@ package main
 import (
 	"fmt"
 	"machine"
+
+	"math"
 	"time"
 
-	"github.com/whoateallthepi/tinygodrivers/rak8nn"
-	//"tinygo.org/x/drivers/bme280"
+	"github.com/whoateallthepi/tinygodrivers/bme280spi"
 	"github.com/whoateallthepi/tinygodrivers/ds3231"
 	"github.com/whoateallthepi/tinygodrivers/ledpanel"
+	"github.com/whoateallthepi/tinygodrivers/rak8nn"
 )
 
 // Program control constants
@@ -20,14 +22,36 @@ const (
 	reportFrequency         = 10 // Every 10 minutes - should be a divisor of 60
 )
 
+// hardware pins
+const (
+	windSpeedPin machine.Pin = machine.GP2
+	rainPin      machine.Pin = machine.GP4
+	windADC                  = machine.ADC0 // GP26
+	batteryADC               = machine.ADC1 // GP27
+	led0         machine.Pin = machine.GP13 // TX - red
+	led1         machine.Pin = machine.GP14 // Status - green
+	led2         machine.Pin = machine.GP15 // RX yellow
+	sensorSPI    machine.Pin = machine.GP17
+	i2cSDA       machine.Pin = machine.GP20
+	i2cSCL       machine.Pin = machine.GP21
+)
+
+// mathmatical constants
+const (
+	pi = 3.14159265
+)
+
 // Interface for loraWan
 type lorawan rak8nn.Networker
+
+// Interface for sensor
+type sensor bme280spi.Sensor
 
 // Interface for clock
 type clock ds3231.Clocker // Interface
 
 // All the values needed for a weather report
-type weatherReport struct {
+type weatherReportDetails struct {
 	temperature      float32
 	humidity         float32
 	pressure         float32
@@ -42,10 +66,44 @@ type weatherReport struct {
 	battery          float32
 }
 
-// status is used for error reporting - see StatusErr
+//====================== Messages ==============================================
+
+type messageHeaderOut struct {
+	timeStamp [8]byte // these are all numbers of hex chars
+	timeZone  [2]byte
+}
+
+type weatherReport struct {
+	header         messageHeaderOut
+	windDir        [3]byte
+	windSpeed      [4]byte
+	windGust       [4]byte
+	windGustDir    [3]byte
+	windSpeed2m    [4]byte
+	windDir2m      [3]byte
+	windGust10m    [4]byte
+	windGustDir10m [3]byte
+	humidity       [4]byte
+	temperature    [4]byte
+	rain1h         [4]byte
+	rainToday      [4]byte
+	rainSinceLast  [4]byte
+	barUncorrected [4]byte
+	barCorrected   [4]byte
+	battery        [4]byte
+}
+
+type stationReport struct {
+	header    messageHeaderOut
+	latitude  [8]byte
+	longitude [8]byte
+	altitude  [4]byte
+}
+
+// status is used for error reporting - see statusErr
 type status int
 
-// statusErr is an implementation of error interface to include a Status integer
+// statusErr is an implementation of error interface to include a status integer
 type statusErr struct {
 	status  status
 	message string
@@ -54,6 +112,7 @@ type statusErr struct {
 // Error codes
 const (
 	noSensor = iota + 1
+	sensorReadError
 	noWindADC
 	failedSend
 	clockError
@@ -76,6 +135,12 @@ const (
 )
 
 func main() {
+
+	for i := 0; i < 10; i++ {
+		fmt.Printf("hello\n")
+		time.Sleep(time.Second)
+	}
+
 	// Various counters....
 
 	var windSpeeds [120]windVector // two-minute record of windspeeds
@@ -86,22 +151,26 @@ func main() {
 	var rainHour [60]float32  // rainfall for each of the past 60 minutes
 	var rainSinceLast float32 // rain since last report
 	var rainToday float32     //reset at midnight
+	// for debouncing
+	var lastRainInterrupt, lastWindInterrupt time.Time
 
 	// ======================= Initialisation ==================================
 	// pins
-	windSpeedPin := machine.GP2
+	/*const windSpeedPin machine.Pin = machine.GP2
+
+	//windSpeedPin := machine.GP2
 	rainPin := machine.GP4
 	//windDirection := machine.GP26
 	windADC := machine.ADC0
 	//battery := machine.GP27
 	batteryADC := machine.ADC1
-	alarmPin := machine.GP3
-
+	//alarmPin := machine.GP3
+	*/
 	// leds
 	// core led = led1 (green), rx led = led2 (yellow), tx led = led0(red)
-	panel := ledpanel.Panel{Pins: ledpanel.Pins{machine.GP13,
-		machine.GP14,
-		machine.GP15},
+	panel := ledpanel.Panel{Pins: ledpanel.Pins{led0,
+		led1,
+		led2},
 		Durations: ledpanel.FlashDurations{},
 	}
 	leds, _ := ledpanel.Configure(panel) // returns a channel
@@ -109,22 +178,22 @@ func main() {
 	f := signalBoot // Three leds, one long flash
 	leds <- f
 
-	// for debouncing
-	var lastRainInterrupt, lastWindInterrupt time.Time
-
 	//configure - interrupt pins
 	windSpeedPin.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
 	rainPin.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
-	alarmPin.Configure((machine.PinConfig{Mode: machine.PinInputPullup}))
 
 	//configure - I2C for clock
-	machine.I2C0.Configure(machine.I2CConfig{SCL: machine.GP21,
-		SDA: machine.GP20,
+	machine.I2C0.Configure(machine.I2CConfig{SCL: i2cSCL,
+		SDA: i2cSDA,
 	})
+
+	//configure SPI for bme280
+	machine.SPI0.Configure(machine.SPIConfig{})
 
 	// create a channels for windclicks, rainclicks
 	windClick := make(chan emptyStruct, 1) // buffer just in case
 	rainClick := make(chan emptyStruct, 1) // do not want interrrups blocking
+	sync := make(chan time.Time)           // used for resyncing to the ds3231 clock
 	//alarmSound := make(chan emptyStruct, 1)
 	//report := make(chan emptyStruct)
 
@@ -134,19 +203,13 @@ func main() {
 	cd := ds3231.New(machine.I2C0) // device implementing clocker interface
 	clock.Configure(&cd)
 
-	/* diag stuff
-	fmt.Println("Reading the clock a few times")
-	for x := 0; x < 5; x++ {
-		dt, err := clock.Read(&cd)
-		if err != nil {
-			fmt.Println("Error reading date:", err)
-		} else {
-			fmt.Printf("Date: %d/%s/%02d %02d:%02d:%02d \r\n", dt.Year(), dt.Month(), dt.Day(), dt.Hour(), dt.Minute(), dt.Second())
-		}
-
-		time.Sleep(time.Second * 5)
+	// SPI for sensor
+	sens := bme280spi.NewSPI(sensorSPI, machine.SPI0, 1)
+	err := sensor.Configure(sens)
+	if err != nil {
+		fmt.Printf("Error configuring sensor: %s\n", err)
 	}
-	*/
+
 	// GPIO interrupt routines
 	windSpeedPin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
 		now := time.Now()
@@ -167,136 +230,19 @@ func main() {
 			lastRainInterrupt = now
 		}
 	})
-	/*
-		alarmPin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
-			fmt.Printf("alarm interrupt\n")
-			alarmSound <- emptyStruct{}
-		}) */
 
 	// ADCs
 	machine.InitADC()
 	windSensor := machine.ADC{Pin: windADC}
+
 	batterySensor := machine.ADC{Pin: batteryADC}
 
-	//========================== Set the alarm - every second ==================
-	// get the current time as a starting point
-	/* dt, err := clock.Read(&cd)
-	if err != nil {
-		fmt.Println("Error reading date:", err)
-
-	}
-	err = clock.SetAlarm(&cd, dt, alarmNumber, ds3231.Minutely) //
-	*/
 	rtc, err := clock.Read(&cd)
 	if err != nil {
 		fmt.Printf("failed to read clock: %s", err)
 	}
-
-	//machineClock := time.Now()
-
-	//clockOffset := rtc.Sub(machineClock) //
-
-	// */
-	//========================= Kick off sub-processes =========================
-	//
-
+	//======================== main processing ================================
 	secondTicker := time.NewTicker(time.Second)
-
-	go secondProcessing(secondTicker,
-		windClick,
-		rainClick,
-		done,
-		&windSpeeds,
-		&windGust10m,
-		&dailyWindGust,
-		&rainHour,
-		&rainToday,
-		&rainSinceLast,
-		windSensor,
-		rtc)
-
-	//go minuteProcessing(&cd, alarmSound, report)
-
-	//go reportWeather(report)
-
-	for {
-
-		b, err := getBatteryLevel(batterySensor)
-		if err != nil {
-			fmt.Printf("Battery ADC error: %s\n", err)
-		}
-
-		d, err := getWindDirection(windSensor)
-		if err != nil {
-			fmt.Printf("Wind ADC error: %s\n", err)
-		}
-
-		fmt.Printf("Wind angle: %2.3f radians. Battery: %2.3f volts\n", d, b)
-		time.Sleep(time.Second * 5)
-
-	}
-	/*
-		//time.Sleep(time.Hour * 24) // long wait!
-
-		d, err := rak8nn.NewDevice("RAK811", 0, 115200)
-
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		err = lorawan.Join(d)
-
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		var data []byte = []byte("aabbcc")
-		var cha uint8 = 100
-
-		r, err := lorawan.Send(d, data, cha)
-
-		if err != nil {
-			fmt.Println(err)
-			return
-		}
-
-		fmt.Println(r)
-
-		/*func readBME280(d bme280.Device) (temperature, pressure, humidity int32, err error) {
-		  	if !d.Connected() {
-		  		return 0, 0, 0, statusErr{
-		  			status:  noSensor,
-		  			message: "BME280 not connected",
-		  		}
-		  	}
-		  	t, _ := d.ReadTemperature()
-		  	p, _ := d.ReadPressure()
-		  	h, _ := d.ReadHumidity()
-
-		  	return t, p, h, nil
-		  }
-	*/
-}
-
-// ======================= sub-processes =======================================
-//
-// secondProcessing does most of the work recording interrupts
-// from the rain and wind speed sensors
-func secondProcessing(t *time.Ticker,
-	wind <-chan emptyStruct,
-	rain <-chan emptyStruct,
-	done <-chan emptyStruct,
-	twoMinWind *[120]windVector,
-	gust10m *[10]windVector,
-	dailyGust *windVector,
-	rainHour *[60]float32,
-	rainToday *float32,
-	rainSinceLast *float32,
-	ws machine.ADC,
-	rtc time.Time) error {
-
 	var windClicks uint8
 
 	// Indexes to various arrays
@@ -306,16 +252,16 @@ func secondProcessing(t *time.Ticker,
 
 	for {
 		select {
-		case <-t.C: /// this is the every second code
+		case <-secondTicker.C: /// this is the every second code
 			// Keep track of real time
 			realTime = realTime.Add(time.Second)
-			windDir, err := getWindDirection(ws)
+			windDir, err := getWindDirection(windSensor)
 			if err != nil {
 				fmt.Printf("error from wind sensor: %s\n", err)
 			}
 			windSp := windMultiplier * float32(windClicks)
-			twoMinWind[seconds2m].angle = windDir
-			twoMinWind[seconds2m].speed = windSp
+			windSpeeds[seconds2m].angle = windDir
+			windSpeeds[seconds2m].speed = windSp
 			seconds2m++
 			if seconds2m > 119 {
 				seconds2m = 0
@@ -326,15 +272,15 @@ func secondProcessing(t *time.Ticker,
 			fmt.Printf("Wind dir: %3.1f\n", windDir)
 
 			// Is this the fastest gust in the current minute??
-			if windSp > gust10m[minutes10m].speed {
-				gust10m[minutes10m].speed = windSp
-				gust10m[minutes10m].angle = windDir
+			if windSp > windGust10m[minutes10m].speed {
+				windGust10m[minutes10m].speed = windSp
+				windGust10m[minutes10m].angle = windDir
 			}
 
 			// Fastest gust today?
-			if windSp > dailyGust.speed {
-				dailyGust.speed = windSp
-				dailyGust.angle = windDir
+			if windSp > dailyWindGust.speed {
+				dailyWindGust.speed = windSp
+				dailyWindGust.angle = windDir
 			}
 			seconds++
 			if seconds > 59 {
@@ -350,99 +296,111 @@ func secondProcessing(t *time.Ticker,
 				// A new minute - need to reset rainclick for current minute
 				// and max gust for current minute
 				rainHour[minutes] = 0
-				gust10m[minutes10m].speed = 0
-				gust10m[minutes10m].angle = 0
+				windGust10m[minutes10m].speed = 0
+				windGust10m[minutes10m].angle = 0
 			}
 
 			windClicks = 0 // reset for next second
 
-			fmt.Printf("Rain today: %2.2f \n", *rainToday)
-			fmt.Printf("mm: %d\n", realTime.Minute())
+			// diag
+			fmt.Printf("Wind angle: %2.3f radians. Wind Speed: %2.3f kph\n",
+				windDir, windSp)
+			fmt.Printf("Rain today: %2.2f \n", rainToday)
+
+			// Check if minutes divides exactly against reporting frequency
 			if realTime.Second() == 0 {
-				r := realTime.Minute() % reportFrequency
-				fmt.Printf("realTime: %t\n", realTime)
-				if r == 0 { // time for a weather report
-					go reportWeather()
+				rem := realTime.Minute() % reportFrequency
+				if rem == 0 { // time for a weather report
+					go reportWeather(sens,
+						batterySensor,
+						windSp,
+						windDir,
+						dailyWindGust,
+						&windSpeeds,  // Ideally we'd pass as copies
+						&windGust10m, // but causes a hardware fault (stack?)
+						rainToday,
+						&rainHour,
+						&rainSinceLast, //reset by reportweather
+					)
 				}
 
 			}
 
-		case <-wind:
+		case <-windClick:
 			windClicks++
-		case <-rain:
-			//
-
-			*rainToday += rainMultiplier
-			*rainSinceLast += rainMultiplier
+		case <-rainClick:
+			rainToday += rainMultiplier
+			rainSinceLast += rainMultiplier
 			rainHour[minutes] += rainMultiplier
-
+		case tt := <-sync:
+			realTime = tt
 		case <-done:
-			return nil
-		}
-
-	}
-}
-func minuteProcessing() {
-	fmt.Printf("Minute processing ************\n")
-}
-
-/*func minuteProcessing(d *ds3231.Device,
-
-	alarm <-chan emptyStruct,
-	report chan<- emptyStruct) error {
-
-	for {
-		_, ok := <-alarm
-		if !ok {
-			fmt.Printf("channel closed\n")
-			return nil
-		}
-		fmt.Printf("Minute processing ************\n")
-		clock.SilenceAlarm(d, alarmNumber)
-		// read the clock
-
-		t, err := clock.Read(d)
-
-		if err != nil {
-			return statusErr{
-				status:  clockError,
-				message: fmt.Sprintf("failed to read clock:%s", err),
-			}
-		}
-		// if it is time for a weather report - signal to the report
-		// channel and reportWeather() takes over.
-		r := t.Minute() % reportFrequency
-		if r == 0 {
-			report <- emptyStruct{}
+			return
 		}
 
 	}
 
-} */
+}
 
-func reportWeather() { fmt.Printf("************* report weather\n") }
+func reportWeather(d *bme280spi.DeviceSPI, // temp sensor
+	b machine.ADC, // battery level
+	ws float32,
+	wd float32,
+	dailyGust windVector,
+	windSpeeds *[120]windVector,
+	gust10 *[10]windVector,
+	rainToday float32,
+	rainHour *[60]float32,
+	rainSinceLast *float32) error {
 
-/*
-func reportWeather(r <-chan emptyStruct) error {
-	// Need to copy all the arrays as the recording will continue in the
-	// background. Also midnight reset needs to wait until report has copied
-	// arrays.
+	fmt.Printf("report weather *********\n")
+	var r weatherReportDetails
+	sr, err := sensor.Read(d)
+	if err != nil {
+		return statusErr{
+			status:  sensorReadError,
+			message: fmt.Sprintf("failed to read sensor: %s", err),
+		}
+	}
 
-	<-r
-	fmt.Printf("************* report weather\n")
+	r.temperature = float32(sr.Temperature) / 1000
+	r.pressure = float32(sr.Pressure) / 100000
+	r.humidity = float32(sr.Humidity) / 100
+	r.currentWind.speed = ws
+	r.currentWind.angle = wd
+	r.dailyGust = dailyGust
+
+	// Two minute average wind
+	twoMin := windSpeeds[:] // make a slice
+	r.twoMinuteAverage, _ = windVectorAverage(twoMin)
+
+	// 10 min max gust
+	for _, v := range gust10 {
+		if v.speed > r.tenMinuteGust.speed {
+			r.tenMinuteGust.speed = v.speed
+			r.tenMinuteGust.angle = v.angle
+		}
+	}
+
+	// rainfall
+	r.rainToday = rainToday
+	// 1h total
+	for _, v := range rainHour {
+		r.rain1hour += v
+	}
+	// Since last
+	r.rainSinceLast = *rainSinceLast
+	*rainSinceLast = 0 // reset - maybe do this after a successful report??
+
+	r.battery, _ = getBatteryLevel(b)
+
+	fmt.Printf("Weather report\n %+v\n", r)
+
 	return nil
-} */
+}
 
-// ================== Calculation and conversion routines =======================
-//
-// getWindDirection takes the ADC reading and returns an angle in radians.
-// The various steps are calculated from the Sparkfun Weather Meters docs - see
-// https://cdn.sparkfun.com/assets/d/1/e/0/6/DS-15901-Weather_Meter.pdf
-// Be careful as there have been several versions of the meters with slightly
-// different resistance values.
 func getWindDirection(windsensor machine.ADC) (float32, error) {
 	const (
-		pi      float32 = 3.1416
 		sectors float32 = 16
 	)
 	var sector float32
@@ -504,4 +462,59 @@ func getBatteryLevel(battery machine.ADC) (float32, error) {
 
 	b := battery.Get()
 	return ((float32(b) - offset) / divisor), nil
+}
+
+// windVectorAverag takes a slice of windVectors and calculates an average speed
+// (simple mean) and direction (a vector sum).
+//
+// This is my encoding of the method at www.noaa.gov/windav.shtml.
+//
+// Each direction and speed pair is broken down into
+// an east-west component and a north-south component.
+// Directions are in Radians clockwise from north, so the
+// north-south component is the cosine of the angle times the speed.
+// The east-west is the sine of the direction * speed. Then add up
+// all the north-south components (NSc) and the east west (EWc)
+// components (separately). The average direction is the arctan
+// of  (sum EWc / sum NSc). For reasons I don't understand,
+// it's better to use the arctan2 call with sum of EWc as the first
+// parameter, sum of NSc as the second (something to do with
+// less likely to be confused about quadrants. The second parameter
+// can't be zero, so make it 360, if that happens.
+
+func windVectorAverage(winds []windVector) (windVector, error) {
+
+	var nSc, eWc, sumSpeeds, avgDir float64
+	// nSc is sum of north-south components
+	// eWc is the east-west components
+	for _, v := range winds {
+		nSc += math.Cos(float64(v.angle)) * float64(v.speed)
+		eWc += math.Sin(float64(v.angle)) * float64(v.speed)
+		sumSpeeds += float64(v.speed)
+	}
+
+	// atanf is meaningless if both components are zero
+	fmt.Printf("...sum nSc = %.2f\n", nSc)
+	fmt.Printf("...sum eWc = %.2f\n", eWc)
+
+	if (eWc == 0) && (nSc == 0) {
+		avgDir = 0
+	} else {
+		avgDir = math.Atan2(eWc, nSc)
+	}
+
+	if avgDir < 0 {
+		avgDir += (2 * pi) // Atan returns between - Pi
+		// and + Pi ( -180 to + 180 degrees)
+	}
+
+	return windVector{speed: float32(sumSpeeds / float64(len(winds))),
+		angle: float32(avgDir)}, nil
+
+}
+
+func radiansToDegrees(radians float32) uint16 {
+
+	return uint16(math.Round(float64(radians * (180 / (pi)))))
+
 }

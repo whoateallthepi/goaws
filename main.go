@@ -15,11 +15,11 @@ import (
 
 // Program control constants
 const (
-	debounce                = time.Millisecond * 100 //
-	windMultiplier  float32 = 2.4                    // one windclick per second = 2.4km/h
-	rainMultiplier  float32 = 0.2794                 // one click of the rain gauge = .2794 mm of rain
-	alarmNumber             = 2
-	reportFrequency         = 10 // Every 10 minutes - should be a divisor of 60
+	debounce               = time.Millisecond * 10
+	windMultiplier float32 = 2.4    // one windclick per second = 2.4km/h
+	rainMultiplier float32 = 0.2794 // one click of the gauge = .2794 mm
+	// alarmNumber             = 2
+	reportFrequency = 10 // Every 10 minutes - should be a divisor of 60
 )
 
 // hardware pins
@@ -41,6 +41,30 @@ const (
 	pi = 3.14159265
 )
 
+// defaults
+const (
+	defaultLatitude  = 0.00
+	defaultLongitude = 0.00
+	defaultAltitude  = 100
+	defaultTimeZone  = 0
+)
+
+// baselines are used to minimize the number of bytes sent by the
+// station. These are added back in to the readings by the base station
+const (
+	baselineTime        = 1640995200 // 2022-01-01 00:00:00 UTC
+	baselinePressure    = 900        // This is in millibars
+	baselineTemperature = 50.00      // added to temperature to avoid negatives
+)
+
+// network statuses
+const (
+	networkUnknown = iota
+	deviceError
+	noLoraWan
+	joinedLoraWan
+)
+
 // Interface for loraWan
 type lorawan rak8nn.Networker
 
@@ -50,8 +74,30 @@ type sensor bme280spi.Sensor
 // Interface for clock
 type clock ds3231.Clocker // Interface
 
+type windVector struct {
+	speed float32
+	angle float32
+}
+
+// Information about this station
+type stationData struct {
+	timeZone      int8
+	latitude      float32
+	longitude     float32
+	altitude      int16
+	networkStatus int8
+	//sendStationReport int8
+}
+
+func (s stationData) String() string {
+	return fmt.Sprintf("timezone: %d, lat: %2.5f, long: %2.5f, alt: %d",
+		s.timeZone, s.latitude, s.longitude, s.altitude)
+}
+
 // All the values needed for a weather report
-type weatherReportDetails struct {
+type weatherReport struct {
+	epochTime        int64
+	timeZone         int8 // currently this is full HOURS only
 	temperature      float32
 	humidity         float32
 	pressure         float32
@@ -66,31 +112,27 @@ type weatherReportDetails struct {
 	battery          float32
 }
 
-//====================== Messages ==============================================
+// Implement the stringer interface on weatherReport so we can use
+// fmt.Sprintf to quickly format the output message
+
+func (w weatherReport) String() string {
+	str, err := formatWeatherReport(w)
+
+	if err != nil {
+		str = "error formatting weather report\n"
+	}
+	return str
+}
+
+// ====================== Messages =============================================
+// message types
+const (
+	weatherData = 100
+)
 
 type messageHeaderOut struct {
 	timeStamp [8]byte // these are all numbers of hex chars
 	timeZone  [2]byte
-}
-
-type weatherReport struct {
-	header         messageHeaderOut
-	windDir        [3]byte
-	windSpeed      [4]byte
-	windGust       [4]byte
-	windGustDir    [3]byte
-	windSpeed2m    [4]byte
-	windDir2m      [3]byte
-	windGust10m    [4]byte
-	windGustDir10m [3]byte
-	humidity       [4]byte
-	temperature    [4]byte
-	rain1h         [4]byte
-	rainToday      [4]byte
-	rainSinceLast  [4]byte
-	barUncorrected [4]byte
-	barCorrected   [4]byte
-	battery        [4]byte
 }
 
 type stationReport struct {
@@ -112,17 +154,13 @@ type statusErr struct {
 // Error codes
 const (
 	noSensor = iota + 1
+	noNetworkDevice
 	sensorReadError
 	noWindADC
-	failedSend
+	failedToSend
 	clockError
 	untrappedError
 )
-
-type windVector struct {
-	speed float32
-	angle float32
-}
 
 type emptyStruct struct{}
 
@@ -130,17 +168,38 @@ func (se statusErr) Error() string {
 	return se.message
 }
 
+// led codes
 const (
+	// three leds
 	signalBoot ledpanel.Control = ledpanel.VeryLong | ledpanel.OneFlash | 0b00000111
+	// red and yellow - three flashes
+	loraWanOK ledpanel.Control = ledpanel.Long |
+		ledpanel.ThreeFlash | ledpanel.Led0 | ledpanel.Led2
+	// four flashes yellow and red
+	loraWanFail ledpanel.Control = ledpanel.Long | ledpanel.FourFlash |
+		ledpanel.Led0 | ledpanel.Led2
+	// two flashes - green led
+	sensorOK ledpanel.Control = ledpanel.Long |
+		ledpanel.TwoFlash | ledpanel.Led1
+	// four flashes red
+	sensorFail ledpanel.Control = ledpanel.FourFlash |
+		ledpanel.Medium | ledpanel.Led0 | ledpanel.Led1
+	txError ledpanel.Control = ledpanel.FourFlash |
+		ledpanel.Long | ledpanel.Led0
+	txSuccess ledpanel.Control = ledpanel.VeryLong | ledpanel.OneFlash |
+		ledpanel.Led0
+		//four flashes RX (yellow)
+	rxError ledpanel.Control = ledpanel.Medium | ledpanel.Led2 |
+		ledpanel.FourFlash
 )
 
 func main() {
-
-	for i := 0; i < 10; i++ {
-		fmt.Printf("hello\n")
-		time.Sleep(time.Second)
-	}
-
+	/*
+		for i := 0; i < 10; i++ {
+			fmt.Printf("hello\n")
+			time.Sleep(time.Second)
+		}
+	*/
 	// Various counters....
 
 	var windSpeeds [120]windVector // two-minute record of windspeeds
@@ -155,19 +214,7 @@ func main() {
 	var lastRainInterrupt, lastWindInterrupt time.Time
 
 	// ======================= Initialisation ==================================
-	// pins
-	/*const windSpeedPin machine.Pin = machine.GP2
 
-	//windSpeedPin := machine.GP2
-	rainPin := machine.GP4
-	//windDirection := machine.GP26
-	windADC := machine.ADC0
-	//battery := machine.GP27
-	batteryADC := machine.ADC1
-	//alarmPin := machine.GP3
-	*/
-	// leds
-	// core led = led1 (green), rx led = led2 (yellow), tx led = led0(red)
 	panel := ledpanel.Panel{Pins: ledpanel.Pins{led0,
 		led1,
 		led2},
@@ -208,7 +255,9 @@ func main() {
 	err := sensor.Configure(sens)
 	if err != nil {
 		fmt.Printf("Error configuring sensor: %s\n", err)
+		leds <- sensorFail
 	}
+	leds <- sensorOK
 
 	// GPIO interrupt routines
 	windSpeedPin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
@@ -241,7 +290,35 @@ func main() {
 	if err != nil {
 		fmt.Printf("failed to read clock: %s", err)
 	}
-	//======================== main processing ================================
+
+	// stationData
+	station := stationData{timeZone: 0,
+		altitude:      defaultAltitude,
+		longitude:     defaultLongitude,
+		latitude:      defaultLatitude,
+		networkStatus: networkUnknown}
+
+	//======================== Connect to network ==============================
+	// need to think about error handling
+	n, err := rak8nn.NewDevice("RAK811", 0, 115200)
+
+	if err != nil {
+		fmt.Printf("failed to connect to network device %s\n", err)
+	}
+
+	station.networkStatus = noLoraWan
+
+	err = lorawan.Join(n)
+	if err != nil {
+		fmt.Printf("failed to connect to network  %s\n", err)
+		leds <- loraWanFail
+	} else {
+		fmt.Printf("connected to network \n")
+	}
+	leds <- loraWanOK
+	station.networkStatus = joinedLoraWan
+
+	//======================== main processing =================================
 	secondTicker := time.NewTicker(time.Second)
 	var windClicks uint8
 
@@ -266,11 +343,11 @@ func main() {
 			if seconds2m > 119 {
 				seconds2m = 0
 			}
-
-			fmt.Printf("windClicks: %d\n", windClicks)
-			fmt.Printf("Wind speed: %3.1f\n", windSp)
-			fmt.Printf("Wind dir: %3.1f\n", windDir)
-
+			/*
+				fmt.Printf("windClicks: %d\n", windClicks)
+				fmt.Printf("Wind speed: %3.1f\n", windSp)
+				fmt.Printf("Wind dir: %3.1f\n", windDir)
+			*/
 			// Is this the fastest gust in the current minute??
 			if windSp > windGust10m[minutes10m].speed {
 				windGust10m[minutes10m].speed = windSp
@@ -301,18 +378,24 @@ func main() {
 			}
 
 			windClicks = 0 // reset for next second
-
-			// diag
-			fmt.Printf("Wind angle: %2.3f radians. Wind Speed: %2.3f kph\n",
-				windDir, windSp)
-			fmt.Printf("Rain today: %2.2f \n", rainToday)
-
+			/*
+				// diag
+				fmt.Printf("Wind angle: %2.3f radians. Wind Speed: %2.3f kph\n",
+					windDir, windSp)
+				fmt.Printf("Rain today: %2.2f \n", rainToday)
+			*/
 			// Check if minutes divides exactly against reporting frequency
 			if realTime.Second() == 0 {
 				rem := realTime.Minute() % reportFrequency
 				if rem == 0 { // time for a weather report
 					go reportWeather(sens,
 						batterySensor,
+						n,  // network device
+						cd, // clock device
+						realTime.Unix(),
+						&station,
+						leds,
+						sync,
 						windSp,
 						windDir,
 						dailyWindGust,
@@ -323,8 +406,33 @@ func main() {
 						&rainSinceLast, //reset by reportweather
 					)
 				}
+				if realTime.Minute() == 0 {
+					// check for midnight processing
+					if realTime.Add(
+						time.Duration(station.timeZone)*time.Hour).Hour() == 00 {
+						// it is midnight we need to reset but make sure
+						// report weather has had time to do it's job
+						go func() {
+							fmt.Printf("**** midnight reset")
+							time.Sleep(time.Second * 10)
+							rainToday = 0
+							dailyWindGust.speed = 0
+							dailyWindGust.angle = 0
+							time.Sleep(time.Second * 30)
+							// resync the clock as the internal tick
+							// drifts a few seconds a day off the RTC
+							t, err := clock.Read(&cd)
+							if err != nil {
+								fmt.Printf("failed to read clock: %s", err)
+								// no point erroring we are in a go routine
+								return
+							}
+							sync <- t // resync to t
+						}()
 
-			}
+					}
+				} // end every 00 minute checks
+			} // evey minute
 
 		case <-windClick:
 			windClicks++
@@ -337,13 +445,17 @@ func main() {
 		case <-done:
 			return
 		}
-
 	}
-
 }
 
 func reportWeather(d *bme280spi.DeviceSPI, // temp sensor
 	b machine.ADC, // battery level
+	n *rak8nn.Device, // network device
+	cd ds3231.Device,
+	e int64, // Unix Time
+	sd *stationData,
+	leds chan<- ledpanel.Control,
+	sync chan<- time.Time,
 	ws float32,
 	wd float32,
 	dailyGust windVector,
@@ -354,7 +466,7 @@ func reportWeather(d *bme280spi.DeviceSPI, // temp sensor
 	rainSinceLast *float32) error {
 
 	fmt.Printf("report weather *********\n")
-	var r weatherReportDetails
+	var r weatherReport
 	sr, err := sensor.Read(d)
 	if err != nil {
 		return statusErr{
@@ -362,9 +474,16 @@ func reportWeather(d *bme280spi.DeviceSPI, // temp sensor
 			message: fmt.Sprintf("failed to read sensor: %s", err),
 		}
 	}
-
-	r.temperature = float32(sr.Temperature) / 1000
-	r.pressure = float32(sr.Pressure) / 100000
+	/*
+		fmt.Printf("bar: %d\n Humidity: %d \n Temperature: %d\n", sr.Pressure,
+			sr.Humidity, sr.Temperature)
+	*/
+	r.epochTime = e - baselineTime
+	r.timeZone = sd.timeZone
+	r.temperature = baselineTemperature + float32(sr.Temperature)/100
+	r.pressure = float32(sr.Pressure)/100 - baselinePressure
+	r.mslp = compensatePressure(sr.Pressure, sd.altitude, r.temperature) -
+		baselinePressure
 	r.humidity = float32(sr.Humidity) / 100
 	r.currentWind.speed = ws
 	r.currentWind.angle = wd
@@ -394,10 +513,141 @@ func reportWeather(d *bme280spi.DeviceSPI, // temp sensor
 
 	r.battery, _ = getBatteryLevel(b)
 
-	fmt.Printf("Weather report\n %+v\n", r)
+	db, err := lorawan.Send(n, []byte(fmt.Sprintf("%s", r)), weatherData)
+	if err != nil {
+		leds <- txError
+		fmt.Printf("****tx error: %s\n", err)
+		return statusErr{status: failedToSend,
+			message: fmt.Sprintf("failed to send to lorawan: %s", err)}
 
+	}
+	leds <- txSuccess
+	//fmt.Printf("datablock: %+v", db)
+
+	if db == nil {
+		fmt.Printf("****rx error: nil datablock - this should not happen")
+		return nil
+	}
+	if db.Bytes == 0 {
+		return nil
+	}
+	err = processDownload(db, sd, leds, cd, sync)
+	if err != nil {
+		return err // this will be ignored - in a goroutine
+	}
 	return nil
 }
+
+//=========================== Formatting messages ==============================
+
+func formatWeatherReport(w weatherReport) (string, error) {
+
+	o := format8Bytes(w.epochTime) +
+		formatNbytes(float32(w.timeZone), 2) +
+		formatWindDirection(w.currentWind.angle) +
+		formatNbytes(w.currentWind.speed*100, 4) +
+		formatNbytes(w.dailyGust.speed*100, 4) +
+		formatWindDirection(w.dailyGust.angle) +
+		formatNbytes(w.twoMinuteAverage.speed*100, 4) +
+		formatWindDirection(w.twoMinuteAverage.angle) +
+		formatNbytes(w.tenMinuteGust.speed*100, 4) +
+		formatWindDirection(w.tenMinuteGust.angle) +
+		formatNbytes(w.humidity*100, 4) +
+		formatNbytes(w.temperature*100, 4) +
+		formatNbytes(w.rain1hour*100, 4) +
+		formatNbytes(w.rainToday*100, 4) +
+		formatNbytes(w.rainSinceLast*100, 4) +
+		formatNbytes(w.pressure*100, 4) +
+		formatNbytes(w.mslp*100, 4) +
+		formatNbytes(w.battery*100, 4)
+
+	return o, nil
+
+}
+
+// ========================== Incoming messages =================================
+// Message types are:
+// 200 - set timezone -
+// 201 - set station data
+// 202 - request station report
+// 203 - reboot station
+func processDownload(db *rak8nn.DataBlock,
+	s *stationData,
+	leds chan<- ledpanel.Control, cd ds3231.Device, sync chan<- time.Time) error {
+
+	switch db.Channel {
+	case 200:
+		if len(db.Data) < 4 {
+			fmt.Printf("Incoming message: %d - invaild length: %d\n",
+				db.Channel, len(db.Data))
+			leds <- rxError
+			return nil
+		}
+
+		s.timeZone = hex2int8(db.Data[0:2])
+
+		ss := hex2int8(db.Data[2:4])
+		t, err := clock.Read(&cd)
+		if err != nil {
+			return statusErr{
+				status:  clockError,
+				message: fmt.Sprintf("failed to read clock: %s", err),
+			}
+		}
+		sd, _ := time.ParseDuration(fmt.Sprintf("%ds", ss))
+
+		t = t.Add(sd)
+		err = clock.Set(&cd, t)
+		if err != nil {
+			return statusErr{
+				status:  clockError,
+				message: fmt.Sprintf("failed to set clock: %s", err),
+			}
+		}
+		/*
+			fmt.Printf("Incoming message: %d , timezone: %d, seconds adjust: %d\n",
+			  db.Channel, hex2int8(db.Data[0:2]), ss)
+		*/
+		// Going to resync clock, but wait a few seconds to avoid
+		// too much jumping over minute boundaries
+		time.Sleep(time.Second * 30)
+		t, err = clock.Read(&cd)
+		if err != nil {
+			return statusErr{
+				status:  clockError,
+				message: fmt.Sprintf("failed to read clock: %s", err),
+			}
+		}
+		sync <- t // resync to t
+		return nil
+	case 201:
+		if len(db.Data) < 20 {
+			fmt.Printf("Incoming message: %d - invaild length: %d\n",
+				db.Channel, len(db.Data))
+			leds <- rxError
+			return nil
+		}
+		s.latitude = float32(hex2int32(db.Data[0:8])) / 100000 // five decimals
+		s.longitude = float32(hex2int32(db.Data[8:16])) / 100000
+		s.altitude = hex2int16(db.Data[16:20])
+
+		//fmt.Printf("Incoming message: %d , lat: %s, long: %s, alt: %s\n",
+		//	db.Channel, db.Data[0:8], db.Data[8:16], db.Data[16:20])
+		//fmt.Printf("Station Data: %s\n", s)
+	case 202:
+		// no data
+		fmt.Printf("Incoming message: %d\n", db.Channel)
+	case 203:
+		fmt.Printf("Incoming message: %d\n", db.Channel)
+	default:
+		// This is an error
+		fmt.Printf("Incoming message: %d - unrecognised channel\n", db.Channel)
+		leds <- rxError
+	}
+	return nil
+}
+
+//========================== Utilities and sensors =============================
 
 func getWindDirection(windsensor machine.ADC) (float32, error) {
 	const (
@@ -494,9 +744,10 @@ func windVectorAverage(winds []windVector) (windVector, error) {
 	}
 
 	// atanf is meaningless if both components are zero
-	fmt.Printf("...sum nSc = %.2f\n", nSc)
-	fmt.Printf("...sum eWc = %.2f\n", eWc)
-
+	/*
+		fmt.Printf("...sum nSc = %.2f\n", nSc)
+		fmt.Printf("...sum eWc = %.2f\n", eWc)
+	*/
 	if (eWc == 0) && (nSc == 0) {
 		avgDir = 0
 	} else {
@@ -510,11 +761,170 @@ func windVectorAverage(winds []windVector) (windVector, error) {
 
 	return windVector{speed: float32(sumSpeeds / float64(len(winds))),
 		angle: float32(avgDir)}, nil
-
 }
 
 func radiansToDegrees(radians float32) uint16 {
 
 	return uint16(math.Round(float64(radians * (180 / (pi)))))
+}
 
+func formatNbytes(f float32, n uint8) string {
+	f2 := int16(math.Round(float64(f))) // two implied decimals
+	formatter := fmt.Sprintf("%%0%dx", n)
+	return fmt.Sprintf(formatter, f2)
+}
+
+func format4Bytes(f float32) string {
+	// returns 4 bytes
+	f2 := int16(math.Round(float64(f)))
+	return fmt.Sprintf("%04x", f2)
+}
+
+func format8Bytes(i int64) string {
+	return fmt.Sprintf("%08x", i)
+}
+
+func formatWindDirection(angle float32) string {
+	d := radiansToDegrees(angle)
+	return fmt.Sprintf("%03x", d)
+}
+
+func compensatePressure(pressure uint32, altitude int16,
+	temperature float32) float32 {
+	var pressureMb float32 = float32(pressure) / 100 // convert to millibars
+	/*
+		fmt.Printf("pressure: %2.2f\n altitude: %d\n temperature: %2.2f\n", pressureMb,
+			altitude, temperature)
+
+		fmt.Printf("calculated %2.2f\n", pressureMb+(pressureMb*9.80665*(float32(altitude))/
+			(287*(273+temperature+float32(altitude)/400))))
+	*/
+	return pressureMb + (pressureMb * 9.80665 * (float32(altitude)) /
+		(287 * (273 + temperature + float32(altitude)/400)))
+
+}
+
+// takes 2 hex digits and convert to an int8
+func hex2int8(hh []byte) int8 {
+	if len(hh) != 2 {
+		// nonsense
+		return 0
+	}
+	value := getNum(hh[0])
+	value <<= 4
+	value += getNum(hh[1])
+	if value > 127 {
+		value -= 128
+		value -= 128
+		//fmt.Printf("Value is: %d\n", value)
+		return int8(value)
+	}
+	return int8(value)
+}
+
+// hex2int32 takes an 8 character slice of hex chars and returns a int32
+// includes 2s complement for -ve nos
+func hex2int32(hh []byte) int32 {
+	if len(hh) != 8 {
+		// nonsense
+		return 0
+	}
+	var value uint32
+	for _, v := range hh {
+		value <<= 4 // doesn't matter 1st time
+		value += uint32(getNum(v))
+	}
+	if value > 0x7FFFFFFF {
+		// This should be a 2s complement -ve
+		value ^= 0xFFFFFFFF
+		value++
+		return int32(0 - value)
+	}
+	return int32(value)
+}
+
+// hex2int16 takes a 4 character slice of hex chars and returns a int32
+// includes 2s complement for -ve nos
+// eg F234 => -3532
+func hex2int16(hh []byte) int16 {
+	if len(hh) != 4 {
+		// nonsense
+		return 0
+	}
+	var value uint16
+	for _, v := range hh {
+		value <<= 4 // doesn't matter 1st time
+		value += uint16(getNum(v))
+	}
+	if value > 0x7FFF {
+		// This should be a 2s complement -ve
+		value ^= 0xFFFF
+		value++
+		return int16(0 - value)
+	}
+	return int16(value)
+}
+
+/*
+int16_t hex2int16(char *hex)
+{
+    // takes 4 hex digits and convert to an int16
+
+    uint16_t value = 0;
+
+    for (int x = 0; x < 4; x++)
+    {
+        value <<= 4; // won't matter the firt time thru
+        value += getNum(*(hex + x));
+    }
+    return value;
+}
+int32_t hex2int32(char *hex)
+{
+    // takes 8 hex digit and convert to an int32
+    // currently no validation
+
+    uint32_t value = 0;
+
+    for (int x = 0; x < 8; x++)
+    {
+        value <<= 4; // won't matter the firt time thru
+        value += getNum(*(hex + x));
+    }
+    return value;
+}
+
+int hex2int2sComplement(char *hex)
+{
+    // takes 2 hex digits and convert to an int
+    int value = 0;
+    value = getNum(*hex);
+    value <<= 4;
+    value += getNum(*(hex + 1));
+    if (value > 127) return (value - 256); else return value;
+}
+
+*/
+// getNum gets numeric value of a hex byte
+func getNum(ch byte) byte {
+
+	if ch >= '0' && ch <= '9' {
+		return (ch - 0x30)
+	}
+	switch {
+	case ch == 'A' || ch == 'a':
+		return 10
+	case ch == 'B' || ch == 'b':
+		return 11
+	case ch == 'C' || ch == 'c':
+		return 12
+	case ch == 'D' || ch == 'd':
+		return 13
+	case ch == 'E' || ch == 'e':
+		return 14
+	case ch == 'F' || ch == 'f':
+		return 15
+	default:
+		return 0
+	}
 }

@@ -34,6 +34,7 @@ const (
 	sensorSPI    machine.Pin = machine.GP17
 	i2cSDA       machine.Pin = machine.GP20
 	i2cSCL       machine.Pin = machine.GP21
+	rebootPin    machine.Pin = machine.GP22 // Base of NPN, C to RUN, E to earth
 )
 
 // mathmatical constants
@@ -81,12 +82,12 @@ type windVector struct {
 
 // Information about this station
 type stationData struct {
-	timeZone      int8
-	latitude      float32
-	longitude     float32
-	altitude      int16
-	networkStatus int8
-	//sendStationReport int8
+	timeZone          int8
+	latitude          float32
+	longitude         float32
+	altitude          int16
+	networkStatus     int8
+	sendStationReport bool
 }
 
 func (s stationData) String() string {
@@ -114,7 +115,6 @@ type weatherReport struct {
 
 // Implement the stringer interface on weatherReport so we can use
 // fmt.Sprintf to quickly format the output message
-
 func (w weatherReport) String() string {
 	str, err := formatWeatherReport(w)
 
@@ -124,10 +124,29 @@ func (w weatherReport) String() string {
 	return str
 }
 
+// all the values needed for a station report
+type stationReport struct {
+	epochTime int64
+	timeZone  int8 // currently this is full HOURS only
+	latitude  float32
+	longitude float32
+	altitude  int16
+}
+
+func (s stationReport) String() string {
+	str, err := formatStationReport(s)
+
+	if err != nil {
+		str = "error formatting station report\n"
+	}
+	return str
+}
+
 // ====================== Messages =============================================
 // message types
 const (
-	weatherData = 100
+	weatherMessage = 100
+	stationMessage = 101
 )
 
 type messageHeaderOut struct {
@@ -135,12 +154,13 @@ type messageHeaderOut struct {
 	timeZone  [2]byte
 }
 
+/*
 type stationReport struct {
 	header    messageHeaderOut
 	latitude  [8]byte
 	longitude [8]byte
 	altitude  [4]byte
-}
+} */
 
 // status is used for error reporting - see statusErr
 type status int
@@ -173,8 +193,8 @@ const (
 	// three leds
 	signalBoot ledpanel.Control = ledpanel.VeryLong | ledpanel.OneFlash | 0b00000111
 	// red and yellow - three flashes
-	loraWanOK ledpanel.Control = ledpanel.Long |
-		ledpanel.ThreeFlash | ledpanel.Led0 | ledpanel.Led2
+	loraWanOK ledpanel.Control = ledpanel.VeryLong |
+		ledpanel.OneFlash | ledpanel.Led0 | ledpanel.Led2
 	// four flashes yellow and red
 	loraWanFail ledpanel.Control = ledpanel.Long | ledpanel.FourFlash |
 		ledpanel.Led0 | ledpanel.Led2
@@ -233,6 +253,9 @@ func main() {
 	machine.I2C0.Configure(machine.I2CConfig{SCL: i2cSCL,
 		SDA: i2cSDA,
 	})
+	// Reboot pin
+	rebootPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
+	rebootPin.Low() // setting high will earth the run pin and force a reload
 
 	//configure SPI for bme280
 	machine.SPI0.Configure(machine.SPIConfig{})
@@ -293,10 +316,11 @@ func main() {
 
 	// stationData
 	station := stationData{timeZone: 0,
-		altitude:      defaultAltitude,
-		longitude:     defaultLongitude,
-		latitude:      defaultLatitude,
-		networkStatus: networkUnknown}
+		altitude:          defaultAltitude,
+		longitude:         defaultLongitude,
+		latitude:          defaultLatitude,
+		sendStationReport: true,
+		networkStatus:     networkUnknown}
 
 	//======================== Connect to network ==============================
 	// need to think about error handling
@@ -408,13 +432,17 @@ func main() {
 				}
 				if realTime.Minute() == 0 {
 					// check for midnight processing
+					dst := realTime.Add(
+						time.Duration(station.timeZone) * time.Hour)
+					fmt.Printf("Real Time: %s,Timezone %d, Calculated DST : %s\n",
+						realTime.String(), station.timeZone, dst.String())
 					if realTime.Add(
 						time.Duration(station.timeZone)*time.Hour).Hour() == 00 {
 						// it is midnight we need to reset but make sure
 						// report weather has had time to do it's job
 						go func() {
-							fmt.Printf("**** midnight reset")
 							time.Sleep(time.Second * 10)
+							fmt.Printf("**** midnight reset\n")
 							rainToday = 0
 							dailyWindGust.speed = 0
 							dailyWindGust.angle = 0
@@ -432,7 +460,43 @@ func main() {
 
 					}
 				} // end every 00 minute checks
-			} // evey minute
+			} else if realTime.Second() == 30 && station.sendStationReport {
+				// something has requested a station report ( message 101)
+				// These go out at 30s past the minute to avoid clashes
+				go func() {
+					var s stationReport
+					s.epochTime = realTime.Unix() - baselineTime
+					s.timeZone = station.timeZone
+					s.latitude = station.latitude
+					s.longitude = station.longitude
+					s.altitude = station.altitude
+					fmt.Printf("*** stationReport: %s\n", s)
+					db, err := lorawan.Send(n, []byte(fmt.Sprintf("%s", s)),
+						stationMessage)
+					if err != nil {
+						leds <- txError
+						fmt.Printf("****tx error: %s\n", err)
+						return
+					}
+					leds <- txSuccess
+					//fmt.Printf("datablock: %+v", db)
+					station.sendStationReport = false
+					if db == nil {
+						fmt.Printf("****rx error: nil datablock - this should not happen")
+						return
+					}
+					if db.Bytes == 0 {
+						return
+					}
+					err = processDownload(db, &station, leds, cd, sync)
+					if err != nil {
+						fmt.Printf("****rx error: %s\n", err)
+						return // this will be ignored - in a goroutine
+					}
+					return
+
+				}()
+			}
 
 		case <-windClick:
 			windClicks++
@@ -513,7 +577,7 @@ func reportWeather(d *bme280spi.DeviceSPI, // temp sensor
 
 	r.battery, _ = getBatteryLevel(b)
 
-	db, err := lorawan.Send(n, []byte(fmt.Sprintf("%s", r)), weatherData)
+	db, err := lorawan.Send(n, []byte(fmt.Sprintf("%s", r)), weatherMessage)
 	if err != nil {
 		leds <- txError
 		fmt.Printf("****tx error: %s\n", err)
@@ -565,6 +629,17 @@ func formatWeatherReport(w weatherReport) (string, error) {
 
 }
 
+func formatStationReport(s stationReport) (string, error) {
+	fmt.Printf("lat: %02.5f lon: %02.5f alt: %d\n", s.latitude,
+		s.longitude, s.altitude)
+	o := format8Bytes(s.epochTime) +
+		formatNbytes(float32(s.timeZone), 2) +
+		formatLatLong(s.latitude*100000) +
+		formatLatLong(s.longitude*100000) +
+		formatInt16(s.altitude)
+	return o, nil
+}
+
 // ========================== Incoming messages =================================
 // Message types are:
 // 200 - set timezone -
@@ -583,7 +658,7 @@ func processDownload(db *rak8nn.DataBlock,
 			leds <- rxError
 			return nil
 		}
-
+		s.sendStationReport = true // Will send report during next cycle
 		s.timeZone = hex2int8(db.Data[0:2])
 
 		ss := hex2int8(db.Data[2:4])
@@ -630,15 +705,18 @@ func processDownload(db *rak8nn.DataBlock,
 		s.latitude = float32(hex2int32(db.Data[0:8])) / 100000 // five decimals
 		s.longitude = float32(hex2int32(db.Data[8:16])) / 100000
 		s.altitude = hex2int16(db.Data[16:20])
-
+		s.sendStationReport = true // Will send report during next cycle
 		//fmt.Printf("Incoming message: %d , lat: %s, long: %s, alt: %s\n",
 		//	db.Channel, db.Data[0:8], db.Data[8:16], db.Data[16:20])
 		//fmt.Printf("Station Data: %s\n", s)
 	case 202:
 		// no data
 		fmt.Printf("Incoming message: %d\n", db.Channel)
+		s.sendStationReport = true
 	case 203:
 		fmt.Printf("Incoming message: %d\n", db.Channel)
+		time.Sleep(time.Second) // just to allow message time to get out
+		rebootPin.High()
 	default:
 		// This is an error
 		fmt.Printf("Incoming message: %d - unrecognised channel\n", db.Channel)
@@ -768,20 +846,44 @@ func radiansToDegrees(radians float32) uint16 {
 	return uint16(math.Round(float64(radians * (180 / (pi)))))
 }
 
+// Takes a float and attemps to return a string of n bytes of
+// hex chars. EG formatNbytes(115, 2) returns "73"
+// Does NOT do 2s complement conversions for -ve numbers
 func formatNbytes(f float32, n uint8) string {
 	f2 := int16(math.Round(float64(f))) // two implied decimals
 	formatter := fmt.Sprintf("%%0%dx", n)
 	return fmt.Sprintf(formatter, f2)
 }
 
-func format4Bytes(f float32) string {
-	// returns 4 bytes
-	f2 := int16(math.Round(float64(f)))
-	return fmt.Sprintf("%04x", f2)
+// Take an int 16 and convert into a 4 char hex string with
+// 2s complement eg -1 = FFFF
+func formatInt16(i int16) string {
+	if i >= 0 {
+		return fmt.Sprintf("%04x", i)
+	}
+	// deal with negative number
+	var i2 uint16
+	i2 = uint16(0 - i) // make +ve
+	i2 ^= 0xFFFF       // flip bits
+	i2++               // Add 1 and hope it overflows...
+	return fmt.Sprintf("%04x", i2)
 }
 
 func format8Bytes(i int64) string {
 	return fmt.Sprintf("%08x", i)
+}
+
+func formatLatLong(l float32) string {
+	if l >= 0 {
+		l2 := int32(math.Round(float64(l)))
+		return fmt.Sprintf("%08x", l2)
+	}
+	// we need to generate a 2s complement
+	l3 := uint32(0 - l) // +ve version of the -ve no
+	l3 ^= 0xFFFFFFFF    // flip all the bits
+	l3++                // Add 1 and hope it overflows...
+	return fmt.Sprintf("%08x", l3)
+
 }
 
 func formatWindDirection(angle float32) string {

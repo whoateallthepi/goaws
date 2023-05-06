@@ -220,6 +220,15 @@ func main() {
 			time.Sleep(time.Second)
 		}
 	*/
+	// Last hope recovery procedure
+	defer func() {
+		if v := recover(); v != nil {
+			fmt.Println(v)
+			// Safest bet is to force a hardware reload
+			rebootPin.High()
+		}
+	}()
+
 	// Various counters....
 
 	var windSpeeds [120]windVector // two-minute record of windspeeds
@@ -446,7 +455,7 @@ func main() {
 							rainToday = 0
 							dailyWindGust.speed = 0
 							dailyWindGust.angle = 0
-							time.Sleep(time.Second * 30)
+							time.Sleep(time.Second * 20)
 							// resync the clock as the internal tick
 							// drifts a few seconds a day off the RTC
 							t, err := clock.Read(&cd)
@@ -457,7 +466,6 @@ func main() {
 							}
 							sync <- t // resync to t
 						}()
-
 					}
 				} // end every 00 minute checks
 			} else if realTime.Second() == 30 && station.sendStationReport {
@@ -471,30 +479,16 @@ func main() {
 					s.longitude = station.longitude
 					s.altitude = station.altitude
 					fmt.Printf("*** stationReport: %s\n", s)
-					db, err := lorawan.Send(n, []byte(fmt.Sprintf("%s", s)),
-						stationMessage)
-					if err != nil {
-						leds <- txError
-						fmt.Printf("****tx error: %s\n", err)
-						return
-					}
-					leds <- txSuccess
-					//fmt.Printf("datablock: %+v", db)
 					station.sendStationReport = false
-					if db == nil {
-						fmt.Printf("****rx error: nil datablock - this should not happen")
-						return
-					}
-					if db.Bytes == 0 {
-						return
-					}
-					err = processDownload(db, &station, leds, cd, sync)
+					err := sendReport(n, cd, &station, leds, sync,
+						[]byte(fmt.Sprintf("%s", s)),
+						stationMessage)
+
 					if err != nil {
-						fmt.Printf("****rx error: %s\n", err)
+						fmt.Printf("****sendStationReport error: %s\n", err)
 						return // this will be ignored - in a goroutine
 					}
 					return
-
 				}()
 			}
 
@@ -530,6 +524,7 @@ func reportWeather(d *bme280spi.DeviceSPI, // temp sensor
 	rainSinceLast *float32) error {
 
 	fmt.Printf("report weather *********\n")
+
 	var r weatherReport
 	sr, err := sensor.Read(d)
 	if err != nil {
@@ -577,25 +572,10 @@ func reportWeather(d *bme280spi.DeviceSPI, // temp sensor
 
 	r.battery, _ = getBatteryLevel(b)
 
-	db, err := lorawan.Send(n, []byte(fmt.Sprintf("%s", r)), weatherMessage)
-	if err != nil {
-		leds <- txError
-		fmt.Printf("****tx error: %s\n", err)
-		return statusErr{status: failedToSend,
-			message: fmt.Sprintf("failed to send to lorawan: %s", err)}
+	err = sendReport(n, cd, sd, leds, sync,
+		[]byte(fmt.Sprintf("%s", r)),
+		weatherMessage)
 
-	}
-	leds <- txSuccess
-	//fmt.Printf("datablock: %+v", db)
-
-	if db == nil {
-		fmt.Printf("****rx error: nil datablock - this should not happen")
-		return nil
-	}
-	if db.Bytes == 0 {
-		return nil
-	}
-	err = processDownload(db, sd, leds, cd, sync)
 	if err != nil {
 		return err // this will be ignored - in a goroutine
 	}
@@ -640,6 +620,38 @@ func formatStationReport(s stationReport) (string, error) {
 	return o, nil
 }
 
+func sendReport(device *rak8nn.Device,
+	clock ds3231.Device,
+	sd *stationData,
+	leds chan<- ledpanel.Control,
+	sync chan<- time.Time,
+	report []byte,
+	reportType uint8) error {
+
+	db, err := lorawan.Send(device, report, reportType)
+	if err != nil {
+		leds <- txError
+		fmt.Printf("****tx error: %s\n", err)
+		return statusErr{status: failedToSend,
+			message: fmt.Sprintf("failed to send to lorawan: %s", err)}
+	}
+	leds <- txSuccess
+	//fmt.Printf("datablock: %+v", db)
+
+	if db == nil {
+		fmt.Printf("****rx error: nil datablock - this should not happen\n")
+		return nil
+	}
+	if db.Bytes == 0 {
+		return nil
+	}
+	err = processDownload(db, sd, clock, leds, sync)
+	if err != nil {
+		return err // this will be ignored - in a goroutine
+	}
+	return nil
+}
+
 // ========================== Incoming messages =================================
 // Message types are:
 // 200 - set timezone -
@@ -647,8 +659,10 @@ func formatStationReport(s stationReport) (string, error) {
 // 202 - request station report
 // 203 - reboot station
 func processDownload(db *rak8nn.DataBlock,
-	s *stationData,
-	leds chan<- ledpanel.Control, cd ds3231.Device, sync chan<- time.Time) error {
+	sd *stationData,
+	cd ds3231.Device,
+	leds chan<- ledpanel.Control,
+	sync chan<- time.Time) error {
 
 	switch db.Channel {
 	case 200:
@@ -658,8 +672,8 @@ func processDownload(db *rak8nn.DataBlock,
 			leds <- rxError
 			return nil
 		}
-		s.sendStationReport = true // Will send report during next cycle
-		s.timeZone = hex2int8(db.Data[0:2])
+		sd.sendStationReport = true // Will send report during next cycle
+		sd.timeZone = hex2int8(db.Data[0:2])
 
 		ss := hex2int8(db.Data[2:4])
 		t, err := clock.Read(&cd)
@@ -702,17 +716,17 @@ func processDownload(db *rak8nn.DataBlock,
 			leds <- rxError
 			return nil
 		}
-		s.latitude = float32(hex2int32(db.Data[0:8])) / 100000 // five decimals
-		s.longitude = float32(hex2int32(db.Data[8:16])) / 100000
-		s.altitude = hex2int16(db.Data[16:20])
-		s.sendStationReport = true // Will send report during next cycle
+		sd.latitude = float32(hex2int32(db.Data[0:8])) / 100000 // five decimals
+		sd.longitude = float32(hex2int32(db.Data[8:16])) / 100000
+		sd.altitude = hex2int16(db.Data[16:20])
+		sd.sendStationReport = true // Will send report during next cycle
 		//fmt.Printf("Incoming message: %d , lat: %s, long: %s, alt: %s\n",
 		//	db.Channel, db.Data[0:8], db.Data[8:16], db.Data[16:20])
 		//fmt.Printf("Station Data: %s\n", s)
 	case 202:
 		// no data
 		fmt.Printf("Incoming message: %d\n", db.Channel)
-		s.sendStationReport = true
+		sd.sendStationReport = true
 	case 203:
 		fmt.Printf("Incoming message: %d\n", db.Channel)
 		time.Sleep(time.Second) // just to allow message time to get out

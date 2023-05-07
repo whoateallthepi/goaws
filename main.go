@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"machine"
+	"runtime/volatile"
 
 	"math"
 	"time"
@@ -75,12 +76,16 @@ type sensor bme280spi.Sensor
 // Interface for clock
 type clock ds3231.Clocker // Interface
 
+// windvector stores a speed and direction. This implementation uses
+// km/h and radians.
 type windVector struct {
 	speed float32
 	angle float32
 }
 
-// Information about this station
+// stationData includes important information about this station
+// altitude should be set correctly (in metres above/below sea level) as
+// this is used to calculate barometric pressure adjusted to sea level
 type stationData struct {
 	timeZone          int8
 	latitude          float32
@@ -95,7 +100,7 @@ func (s stationData) String() string {
 		s.timeZone, s.latitude, s.longitude, s.altitude)
 }
 
-// All the values needed for a weather report
+// weatherReport includes all the values needed for a weather report
 type weatherReport struct {
 	epochTime        int64
 	timeZone         int8 // currently this is full HOURS only
@@ -124,7 +129,7 @@ func (w weatherReport) String() string {
 	return str
 }
 
-// all the values needed for a station report
+// stationReport is a struct with all the values needed for a station report
 type stationReport struct {
 	epochTime int64
 	timeZone  int8 // currently this is full HOURS only
@@ -214,7 +219,9 @@ func main() {
 	rebootPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
 	rebootPin.Low() // setting high will earth the run pin and force a reload
 
-	// Last hope recovery procedure
+	// Last hope recovery procedure. Note recover isn't fully implemented
+	// in TinyGo.
+	// See https://tinygo.org/docs/reference/lang-support/#a-note-on-the-recover-builtin
 	defer func() {
 		if v := recover(); v != nil {
 			fmt.Println(v)
@@ -235,6 +242,7 @@ func main() {
 	var rainToday float32     //reset at midnight
 	// for debouncing
 	var lastRainInterrupt, lastWindInterrupt time.Time
+	var windClicks uint8
 
 	// ======================= Initialisation ==================================
 	//
@@ -287,7 +295,10 @@ func main() {
 		now := time.Now()
 		if now.Sub(lastWindInterrupt) > debounce {
 			// Record
-			windClick <- emptyStruct{}
+			w := volatile.LoadUint8(&windClicks)
+			w++
+			volatile.StoreUint8(&windClicks, w)
+			//windClick <- emptyStruct{}
 			//fmt.Println("Windspeed")
 			lastWindInterrupt = now
 		}
@@ -345,7 +356,6 @@ func main() {
 	//======================== main loop =======================================
 	//
 	secondTicker := time.NewTicker(time.Second)
-	var windClicks uint8
 
 	// Indexes to various arrays
 	var seconds2m, seconds, minutes, minutes10m uint8
@@ -362,7 +372,8 @@ func main() {
 			if err != nil {
 				fmt.Printf("error from wind sensor: %s\n", err)
 			}
-			windSp := windMultiplier * float32(windClicks)
+			w := volatile.LoadUint8(&windClicks)
+			windSp := windMultiplier * float32(w)
 			windSpeeds[seconds2m].angle = windDir
 			windSpeeds[seconds2m].speed = windSp
 			seconds2m++
@@ -402,8 +413,7 @@ func main() {
 				windGust10m[minutes10m].speed = 0
 				windGust10m[minutes10m].angle = 0
 			}
-
-			windClicks = 0 // reset for next second
+			volatile.StoreUint8(&windClicks, 0) // reset for next second
 			/*
 				// diag
 				fmt.Printf("Wind angle: %2.3f radians. Wind Speed: %2.3f kph\n",

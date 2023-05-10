@@ -26,7 +26,7 @@ const (
 // hardware pins
 const (
 	windSpeedPin machine.Pin = machine.GP2
-	rainPin      machine.Pin = machine.GP4
+	rainPin      machine.Pin = machine.GP3
 	windADC                  = machine.ADC0 // GP26
 	batteryADC               = machine.ADC1 // GP27
 	led0         machine.Pin = machine.GP13 // TX - red
@@ -220,8 +220,9 @@ func main() {
 	rebootPin.Low() // setting high will earth the run pin and force a reload
 
 	// Last hope recovery procedure. Note recover isn't fully implemented
-	// in TinyGo.
-	// See https://tinygo.org/docs/reference/lang-support/#a-note-on-the-recover-builtin
+	// in TinyGo. See
+	// https://tinygo.org/docs/reference/lang-support/#a-note-on-the-recover-builtin
+	//
 	defer func() {
 		if v := recover(); v != nil {
 			fmt.Println(v)
@@ -725,8 +726,8 @@ func processDownload(db *rak8nn.DataBlock,
 
 //========================== Utilities and sensors =============================
 
-// getWindDirection returns the angle of the weather vane in radians ( 2pi
-// radians = 360 degrees)
+// getWindDirection returns the angle of the weather vane in radians
+// ( 2pi radians = 360 degrees)
 func getWindDirection(windsensor machine.ADC) (float32, error) {
 	const (
 		sectors float32 = 16
@@ -807,7 +808,7 @@ func getBatteryLevel(battery machine.ADC) (float32, error) {
 // of  (sum EWc / sum NSc). For reasons I don't understand,
 // it's better to use the arctan2 call with sum of EWc as the first
 // parameter, sum of NSc as the second (something to do with
-// less likely to be confused about quadrants. The second parameter
+// less likely to be confused about quadrants). The second parameter
 // can't be zero, so make it 360, if that happens.
 func windVectorAverage(winds []windVector) (windVector, error) {
 

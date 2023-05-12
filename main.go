@@ -21,6 +21,7 @@ const (
 	rainMultiplier float32 = 0.2794 // one click of the gauge = .2794 mm
 	// alarmNumber             = 2
 	reportFrequency = 10 // Every 10 minutes - should be a divisor of 60
+	flashInterval   = 20 // Flash green led (led1) every n seconds
 )
 
 // hardware pins
@@ -204,6 +205,10 @@ const (
 		//four flashes RX (yellow)
 	rxError ledpanel.Control = ledpanel.Medium | ledpanel.Led2 |
 		ledpanel.FourFlash
+	aliveFlash ledpanel.Control = ledpanel.Short | ledpanel.OneFlash |
+		ledpanel.Led1
+	aliveNoNetwork ledpanel.Control = ledpanel.Short |
+		ledpanel.OneFlash | ledpanel.Led1 | ledpanel.Led0
 )
 
 // =============================== main ========================================
@@ -269,12 +274,11 @@ func main() {
 	//configure SPI for bme280
 	machine.SPI0.Configure(machine.SPIConfig{})
 
-	// create a channels for windclicks, rainclicks
+	// create a channels for windclicks, rainclicks, alive
 	windClick := make(chan emptyStruct, 1) // buffer just in case
 	rainClick := make(chan emptyStruct, 1) // do not want interrrups blocking
-	sync := make(chan time.Time)           // used for resyncing to the ds3231 clock
-	//alarmSound := make(chan emptyStruct, 1)
-	//report := make(chan emptyStruct)
+	sync := make(chan emptyStruct, 1)      // used for resyncing to the ds3231 clock
+	alive := make(chan emptyStruct, 1)
 
 	done := make(chan emptyStruct)
 
@@ -481,13 +485,16 @@ func main() {
 							weatherMessage)
 
 						if err != nil {
-							fmt.Printf("failed to send report: %s\n", err)
+							fmt.Printf("Failed to send. Data: %s, Error: %s\n",
+								r,
+								err)
 
 							return // error would be ignored - in a goroutine
 						}
 						return
 					}()
 				}
+
 				if realTime.Minute() == 0 {
 					// check for midnight processing
 					dst := realTime.Add(
@@ -507,13 +514,8 @@ func main() {
 							time.Sleep(time.Second * 20)
 							// resync the clock as the internal tick
 							// drifts a few seconds a day off the RTC
-							t, err := clock.Read(&cd)
-							if err != nil {
-								fmt.Printf("failed to read clock: %s", err)
-								// no point erroring we are in a go routine
-								return
-							}
-							sync <- t // resync to t
+							sync <- emptyStruct{} // resync to t
+							return
 						}()
 					}
 				} // end every 00 minute checks
@@ -540,16 +542,34 @@ func main() {
 					return
 				}()
 			}
+			// flash led1 periodically
+			if realTime.Unix()%flashInterval == 0 {
+				alive <- emptyStruct{}
+			}
 		case <-windClick:
 			windClicks++
 		case <-rainClick:
 			rainToday += rainMultiplier
 			rainSinceLast += rainMultiplier
 			rainHour[minutes] += rainMultiplier
-		case tt := <-sync:
+		case <-sync:
 			// resync the realTime variable to the clock
-			realTime = tt
-		// never ends!
+			t, err := clock.Read(&cd)
+			if err != nil {
+				fmt.Printf("failed to read clock: %s", err)
+				// no point erroring we are in a go routine
+
+			} else {
+				realTime = t
+			}
+		case <-alive:
+			if station.networkStatus == joinedLoraWan {
+				leds <- aliveFlash
+			} else {
+				leds <- aliveNoNetwork
+			}
+
+			// never ends!
 		case <-done:
 			return
 		}
@@ -584,8 +604,8 @@ func formatWeatherReport(w weatherReport) (string, error) {
 }
 
 func formatStationReport(s stationReport) (string, error) {
-	fmt.Printf("lat: %02.5f lon: %02.5f alt: %d\n", s.latitude,
-		s.longitude, s.altitude)
+	//fmt.Printf("lat: %02.5f lon: %02.5f alt: %d\n", s.latitude,
+	//	s.longitude, s.altitude)
 	o := format8Bytes(s.epochTime) +
 		formatNbytes(float32(s.timeZone), 2) +
 		formatLatLong(s.latitude*100000) +
@@ -601,7 +621,7 @@ func sendReport(device *rak8nn.Device,
 	clock ds3231.Device,
 	sd *stationData,
 	leds chan<- ledpanel.Control,
-	sync chan<- time.Time,
+	sync chan<- emptyStruct,
 	report []byte,
 	reportType uint8) error {
 
@@ -647,7 +667,7 @@ func processDownload(db *rak8nn.DataBlock,
 	sd *stationData,
 	cd ds3231.Device,
 	leds chan<- ledpanel.Control,
-	sync chan<- time.Time) error {
+	sync chan<- emptyStruct) error {
 
 	switch db.Channel {
 	case 200:
@@ -692,7 +712,7 @@ func processDownload(db *rak8nn.DataBlock,
 				message: fmt.Sprintf("failed to read clock: %s", err),
 			}
 		}
-		sync <- t // resync to t
+		sync <- emptyStruct{} // resync to t
 		return nil
 	case 201:
 		if len(db.Data) < 20 {
@@ -790,7 +810,11 @@ func getBatteryLevel(battery machine.ADC) (float32, error) {
 	)
 
 	b := battery.Get()
-	return ((float32(b) - offset) / divisor), nil
+	v := ((float32(b) - offset) / divisor)
+	if v < 0 {
+		v = 0
+	}
+	return v, nil
 }
 
 // windVectorAverage takes a slice of windVectors and calculates an average speed

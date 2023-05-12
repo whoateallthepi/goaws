@@ -186,4 +186,5 @@ The pico reports various statuses and errors by flashing LEDs on the station pan
 | TX success | * | | | 1 | Successful uplink to gateway |
 |**TX fail** | * | | | 4 | Transmit fail - either no response from modem or an error code |
 | Alive | | * | | 1 | Flashed evey 15s just for reassurance |
+| **Alive - no network** | * | * |   | 1 | Every 15s - no network but working
 

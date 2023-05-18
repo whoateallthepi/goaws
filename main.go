@@ -213,12 +213,12 @@ const (
 
 // =============================== main ========================================
 func main() {
-	/* diagnostics
+	//diagnostics
 	for i := 0; i < 10; i++ {
 		fmt.Printf("hello\n")
 		time.Sleep(time.Second)
 	}
-	*/
+	//
 	//=========================== deferred functions ===========================
 	// Reboot pin
 	rebootPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
@@ -228,12 +228,10 @@ func main() {
 	// in TinyGo. See
 	// https://tinygo.org/docs/reference/lang-support/#a-note-on-the-recover-builtin
 	//
+	// Commented out - causing stack overflow??
 	defer func() {
-		if v := recover(); v != nil {
-			fmt.Println(v)
-			// Safest bet is to force a hardware reload
-			rebootPin.High()
-		}
+		// Safest bet is to force a hardware reload
+		rebootPin.High()
 	}()
 
 	//========================== variables =====================================
@@ -261,7 +259,7 @@ func main() {
 	// flash all three leds to confirm boot
 	f := signalBoot // Three leds, one long flash
 	leds <- f
-
+	//time.Sleep(time.Second)
 	//configure - interrupt pins
 	windSpeedPin.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
 	rainPin.Configure(machine.PinConfig{Mode: machine.PinInputPullup})
@@ -290,11 +288,11 @@ func main() {
 	sens := bme280spi.NewSPI(sensorSPI, machine.SPI0, 1)
 	err := sensor.Configure(sens)
 	if err != nil {
-		fmt.Printf("Error configuring sensor: %s\n", err)
+		fmt.Printf("Error configuring sensor\n")
 		leds <- sensorFail
+	} else {
+		leds <- sensorOK
 	}
-	leds <- sensorOK
-
 	// GPIO interrupt routines
 	windSpeedPin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
 		now := time.Now()
@@ -435,7 +433,7 @@ func main() {
 						var r weatherReport
 						sr, err := sensor.Read(sens)
 						if err != nil {
-							fmt.Printf("failed to read sensor: %s\n", err)
+							fmt.Printf("failed to read sensor\n")
 							return
 						}
 						/*

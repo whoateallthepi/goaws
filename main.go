@@ -11,6 +11,7 @@ import (
 	"github.com/whoateallthepi/tinygodrivers/bme280spi"
 	"github.com/whoateallthepi/tinygodrivers/ds3231"
 	"github.com/whoateallthepi/tinygodrivers/ledpanel"
+
 	"github.com/whoateallthepi/tinygodrivers/rak8nn"
 )
 
@@ -68,8 +69,28 @@ const (
 	joinedLoraWan
 )
 
-// Interface for loraWan
-type lorawan rak8nn.Networker
+//======================== Interfacing =========================================
+
+type networker interface {
+	Initialise() error
+	Join() error
+	Send(sendData []byte, sendChannel uint8) (channel uint8, // channel
+		rssi int16, // rssi
+		snr int16, // Snr
+		bytes uint8, // byte count
+		data []byte, // data
+		err error)
+}
+
+type network struct {
+	network networker
+}
+
+func newNetwork(networker networker) *network {
+	return &network{
+		network: networker,
+	}
+}
 
 // Interface for sensor
 type sensor bme280spi.Sensor
@@ -213,12 +234,12 @@ const (
 
 // =============================== main ========================================
 func main() {
-	//diagnostics
+	/*diagnostics
 	for i := 0; i < 10; i++ {
 		fmt.Printf("hello\n")
 		time.Sleep(time.Second)
 	}
-	//
+	*/
 	//=========================== deferred functions ===========================
 	// Reboot pin
 	rebootPin.Configure(machine.PinConfig{Mode: machine.PinOutput})
@@ -338,15 +359,20 @@ func main() {
 
 	//======================== Connect to network ==============================
 	//
-	n, err := rak8nn.NewDevice("RAK811", 0, 115200)
+
+	// create a network device
+	d, err := rak8nn.NewDevice("RAK811", 0, 115200)
 
 	if err != nil {
 		fmt.Printf("failed to connect to network device %s\n", err)
 	}
 
+	// create the network - device should implement interface
+	n := newNetwork(d).network
+
 	station.networkStatus = noLoraWan
 
-	err = lorawan.Join(n)
+	err = n.Join()
 	if err != nil {
 		fmt.Printf("failed to connect to network  %s\n", err)
 		leds <- loraWanFail
@@ -450,6 +476,12 @@ func main() {
 						r.mslp = compensatePressure(sr.Pressure,
 							station.altitude, r.temperature) - baselinePressure
 						r.humidity = float32(sr.Humidity) / 100
+						// for compatibility with C driver. Humidities
+						// wildly over this (outside the stratoshpere) are an
+						// artifact of the sensor.
+						if r.humidity > 102.40 {
+							r.humidity = 102.40
+						}
 						r.currentWind.speed = windSp
 						r.currentWind.angle = windDir
 						r.dailyGust = dailyWindGust
@@ -615,7 +647,7 @@ func formatStationReport(s stationReport) (string, error) {
 // sendReport sends a slice of bytes to the interface.
 // The slice should consist of hex characters - eg FF1234AB... - see
 // formatStationReport and formatWeatherReport for the formatting
-func sendReport(device *rak8nn.Device,
+func sendReport(n networker,
 	clock ds3231.Device,
 	sd *stationData,
 	leds chan<- ledpanel.Control,
@@ -623,7 +655,7 @@ func sendReport(device *rak8nn.Device,
 	report []byte,
 	reportType uint8) error {
 
-	db, err := lorawan.Send(device, report, reportType)
+	ch, rssi, snr, count, data, err := n.Send(report, reportType)
 	if err != nil {
 		leds <- txError
 		fmt.Printf("****tx error: %s\n", err)
@@ -633,14 +665,10 @@ func sendReport(device *rak8nn.Device,
 	leds <- txSuccess
 	//fmt.Printf("datablock: %+v", db)
 
-	if db == nil {
-		fmt.Printf("****rx error: nil datablock - this should not happen\n")
+	if count == 0 {
 		return nil
 	}
-	if db.Bytes == 0 {
-		return nil
-	}
-	err = processDownload(db, sd, clock, leds, sync)
+	err = processDownload(ch, rssi, snr, count, data, sd, clock, leds, sync)
 	if err != nil {
 		return err // this will be ignored - in a goroutine
 	}
@@ -661,24 +689,28 @@ func sendReport(device *rak8nn.Device,
 // 201 - set station data
 // 202 - request station report
 // 203 - reboot station
-func processDownload(db *rak8nn.DataBlock,
+func processDownload(ch uint8,
+	rs int16,
+	snr int16,
+	byteCount uint8,
+	data []byte,
 	sd *stationData,
 	cd ds3231.Device,
 	leds chan<- ledpanel.Control,
 	sync chan<- emptyStruct) error {
 
-	switch db.Channel {
+	switch ch {
 	case 200:
-		if len(db.Data) < 4 {
+		if len(data) < 4 {
 			fmt.Printf("Incoming message: %d - invaild length: %d\n",
-				db.Channel, len(db.Data))
+				ch, len(data))
 			leds <- rxError
 			return nil
 		}
 		sd.sendStationReport = true // Will send report during next cycle
-		sd.timeZone = hex2int8(db.Data[0:2])
+		sd.timeZone = hex2int8(data[0:2])
 
-		ss := hex2int8(db.Data[2:4])
+		ss := hex2int8(data[2:4])
 		t, err := clock.Read(&cd)
 		if err != nil {
 			return statusErr{
@@ -713,30 +745,30 @@ func processDownload(db *rak8nn.DataBlock,
 		sync <- emptyStruct{} // resync to t
 		return nil
 	case 201:
-		if len(db.Data) < 20 {
+		if len(data) < 20 {
 			fmt.Printf("Incoming message: %d - invaild length: %d\n",
-				db.Channel, len(db.Data))
+				ch, len(data))
 			leds <- rxError
 			return nil
 		}
-		sd.latitude = float32(hex2int32(db.Data[0:8])) / 100000 // five decimals
-		sd.longitude = float32(hex2int32(db.Data[8:16])) / 100000
-		sd.altitude = hex2int16(db.Data[16:20])
+		sd.latitude = float32(hex2int32(data[0:8])) / 100000 // five decimals
+		sd.longitude = float32(hex2int32(data[8:16])) / 100000
+		sd.altitude = hex2int16(data[16:20])
 		sd.sendStationReport = true // Will send report during next cycle
 		//fmt.Printf("Incoming message: %d , lat: %s, long: %s, alt: %s\n",
 		//	db.Channel, db.Data[0:8], db.Data[8:16], db.Data[16:20])
 		//fmt.Printf("Station Data: %s\n", s)
 	case 202:
 		// no data
-		fmt.Printf("Incoming message: %d\n", db.Channel)
+		fmt.Printf("Incoming message: %d\n", ch)
 		sd.sendStationReport = true
 	case 203:
-		fmt.Printf("Incoming message: %d\n", db.Channel)
+		fmt.Printf("Incoming message: %d\n", ch)
 		time.Sleep(time.Second) // just to allow message time to get out
 		rebootPin.High()
 	default:
 		// This is an error
-		fmt.Printf("Incoming message: %d - unrecognised channel\n", db.Channel)
+		fmt.Printf("Incoming message: %d - unrecognised channel\n", ch)
 		leds <- rxError
 	}
 	return nil

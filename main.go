@@ -34,6 +34,7 @@ const (
 	led0         machine.Pin = machine.GP13 // TX - red
 	led1         machine.Pin = machine.GP14 // Status - green
 	led2         machine.Pin = machine.GP15 // RX yellow
+	led3         machine.Pin = machine.LED  // On board LED
 	sensorSPI    machine.Pin = machine.GP17
 	i2cSDA       machine.Pin = machine.GP20
 	i2cSCL       machine.Pin = machine.GP21
@@ -205,9 +206,9 @@ func (se statusErr) Error() string {
 
 // led codes
 const (
-	// three leds
-	signalBoot ledpanel.Control = ledpanel.VeryLong | ledpanel.OneFlash | 0b00000111
-	// red and yellow - three flashes
+	// all leds - long flash
+	signalBoot ledpanel.Control = ledpanel.VeryLong | ledpanel.OneFlash | 0b00001111
+	// red, yellow one long flash
 	loraWanOK ledpanel.Control = ledpanel.VeryLong |
 		ledpanel.OneFlash | ledpanel.Led0 | ledpanel.Led2
 	// four flashes yellow and red
@@ -273,12 +274,13 @@ func main() {
 	//
 	panel := ledpanel.Panel{Pins: ledpanel.Pins{led0,
 		led1,
-		led2},
+		led2,
+		led3},
 		Durations: ledpanel.FlashDurations{},
 	}
 	leds, _ := ledpanel.Configure(panel) // returns a channel
-	// flash all three leds to confirm boot
-	f := signalBoot // Three leds, one long flash
+	// flash all four leds to confirm boot
+	f := signalBoot // Four leds, one long flash
 	leds <- f
 	//time.Sleep(time.Second)
 	//configure - interrupt pins
@@ -314,29 +316,6 @@ func main() {
 	} else {
 		leds <- sensorOK
 	}
-	// GPIO interrupt routines
-	windSpeedPin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
-		now := time.Now()
-		if now.Sub(lastWindInterrupt) > debounce {
-			// Record
-			w := volatile.LoadUint8(&windClicks)
-			w++
-			volatile.StoreUint8(&windClicks, w)
-			//windClick <- emptyStruct{}
-			//fmt.Println("Windspeed")
-			lastWindInterrupt = now
-		}
-
-	})
-	rainPin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
-		now := time.Now()
-		if now.Sub(lastRainInterrupt) > debounce {
-			// Record
-			rainClick <- emptyStruct{}
-			//fmt.Println("Rain")
-			lastRainInterrupt = now
-		}
-	})
 
 	// ADCs
 	machine.InitADC()
@@ -378,9 +357,34 @@ func main() {
 		leds <- loraWanFail
 	} else {
 		fmt.Printf("connected to network \n")
+		leds <- loraWanOK
+		station.networkStatus = joinedLoraWan
 	}
-	leds <- loraWanOK
-	station.networkStatus = joinedLoraWan
+
+	// GPIO interrupt routines - initilise these late to avoid excess readings
+	// on boot
+	windSpeedPin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
+		now := time.Now()
+		if now.Sub(lastWindInterrupt) > debounce {
+			// Record
+			w := volatile.LoadUint8(&windClicks)
+			w++
+			volatile.StoreUint8(&windClicks, w)
+			//windClick <- emptyStruct{}
+			//fmt.Println("Windspeed")
+			lastWindInterrupt = now
+		}
+
+	})
+	rainPin.SetInterrupt(machine.PinFalling, func(p machine.Pin) {
+		now := time.Now()
+		if now.Sub(lastRainInterrupt) > debounce {
+			// Record
+			rainClick <- emptyStruct{}
+			//fmt.Println("Rain")
+			lastRainInterrupt = now
+		}
+	})
 
 	//======================== main loop =======================================
 	//
@@ -468,13 +472,33 @@ func main() {
 								sr.Humidity,
 								sr.Temperature)
 						*/
+						/*
+							Bad reads from the sensor can produce wild results
+							that lead to a -ve value in the data stream.
+							This stuffs up the modem and makes the transmit fail.
+							Trap these here.
+						*/
 						r.epochTime = realTime.Unix() - baselineTime
 						r.timeZone = station.timeZone
+
 						r.temperature = baselineTemperature +
 							float32(sr.Temperature)/100
+						if r.temperature < 0 {
+							r.temperature = 0
+						}
+
 						r.pressure = float32(sr.Pressure)/100 - baselinePressure
+						if r.pressure < 0 {
+							r.pressure = 0
+						}
+
 						r.mslp = compensatePressure(sr.Pressure,
 							station.altitude, r.temperature) - baselinePressure
+
+						if r.mslp < 0 {
+							r.mslp = 0
+						}
+
 						r.humidity = float32(sr.Humidity) / 100
 						// for compatibility with C driver. Humidities
 						// wildly over this (outside the stratoshpere) are an
@@ -482,6 +506,11 @@ func main() {
 						if r.humidity > 102.40 {
 							r.humidity = 102.40
 						}
+
+						if r.humidity < 0 {
+							r.humidity = 0
+						}
+
 						r.currentWind.speed = windSp
 						r.currentWind.angle = windDir
 						r.dailyGust = dailyWindGust
